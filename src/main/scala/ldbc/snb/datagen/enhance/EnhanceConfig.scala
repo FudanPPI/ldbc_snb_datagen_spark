@@ -24,10 +24,8 @@ case class EnhanceConfig(
     hotmsgLikes: Long = 1000,
     hotmsgReplies: Long = 50,
     hotmsgTags: Long = 8,
-    smallcompEnabled: Boolean = false,
-    smallcompCount: Long = 1000,
-    smallcompCliqueMax: Int = 5,
-    smallcompReserveBase: Long = 1000000000000L,
+    smallcompEnabled: Boolean = false, smallcompCount: Long = 1000, smallcompCliqueMax: Int = 5,
+    smallcompReserveBase: Long = 0, // 0 = auto: (255L << 36) + numPersons (bucket-255 reserve band)
     fragmentDropKnowsRatio: Double = 0.0,
     unidirFlipRatio: Double = 0.0,
     rmatEnabled: Boolean = false,
