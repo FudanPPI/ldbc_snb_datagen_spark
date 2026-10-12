@@ -1,6 +1,10 @@
 name := "ldbc_snb_datagen"
 organization := "ldbc.snb.datagen"
 
+// sbt-dynver was removed from project/plugins.sbt (artifact unavailable upstream);
+// pin a fixed version instead of deriving it from git tags.
+version := "0.6.0-enhance"
+
 scmInfo := {
   val org = "ldbc"
   val project = "ldbc_snb_datagen_spark"

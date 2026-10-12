@@ -1,269 +1,157 @@
-![LDBC_LOGO](https://raw.githubusercontent.com/wiki/ldbc/ldbc_snb_datagen_spark/images/ldbc-logo.png)
+# LDBC SNB Datagen (Spark) — 倾斜增强版
 
-# LDBC SNB Datagen (Spark-based)
+基于官方 [LDBC SNB Datagen (Spark)](https://github.com/ldbc/ldbc_snb_datagen_spark) 的**增强改造版本**。在完整保留原生 LDBC SNB Schema、生成规范与基准兼容性的前提下，通过参数化增强模块，向 TB 级异构社交网络图中注入真实业务典型病态特征，用于分布式图计算引擎、图数据库、分布式调度等系统的极限性能评测。
 
-[![Build Status](https://circleci.com/gh/ldbc/ldbc_snb_datagen_spark.svg?style=svg)](https://circleci.com/gh/ldbc/ldbc_snb_datagen_spark)
+> **设计原则**：原生生成逻辑零侵入 —— 所有增强特征以独立 Transform 实现（作用于生成的中间数据 IR），默认全部关闭（行为与原生版完全一致），通过 CLI 参数逐项开启；支持"原生基线 / 增强版"双数据集对照实验。
 
-The LDBC SNB Data Generator (Datagen) produces the datasets for the [LDBC Social Network Benchmark's workloads](https://ldbcouncil.org/benchmarks/snb/). The generator is designed to produce directed labelled graphs that mimic the characteristics of those graphs of real data. A detailed description of the schema produced by Datagen, as well as the format of the output files, can be found in the latest version of official [LDBC SNB specification document](https://github.com/ldbc/ldbc_snb_docs).
+详细设计文档见 [docs/ENHANCE.md](docs/ENHANCE.md)。
 
-:scroll: If you wish to cite the LDBC SNB, please refer to the [documentation repository](https://github.com/ldbc/ldbc_snb_docs#how-to-cite-ldbc-benchmarks).
+## 增强特性
 
-:warning: There are two different versions of the Datagen:
+五大增强模块，全部独立开关、参数可调：
 
-* The [Hadoop-based Datagen](https://github.com/ldbc/ldbc_snb_datagen_hadoop/) generates the Interactive workload's SF1-1000 data sets.
-* For the BI workload, use the Spark-based Datagen (in this repository).
+### 1. 分区负载偏斜（Partition Skew）
 
-For each commit on the `main` branch, the CI deploys [freshly generated small data sets](https://ldbcouncil.org/ldbc_snb_datagen_spark/).
+原生 SNB 节点 ID 随机分布、分片天然均衡，无法模拟集群热点。本模块使用**确定性双射 ID 重映射**（零 shuffle、零 Action，纯列表达式），把超级节点、热人及其全部关联内容（knows 边、帖子、评论、点赞、论坛成员）聚集到 [0, N/K) 热分区，构造「高热分区 / 普通分区 / 空分区」差异化负载：
 
-## Quick start
+```ini
+enhance.remap.enabled      = true
+enhance.remap.hotEvery     = 20    # 每 20 个 Person id 取 1 个为热人
+```
 
-### Build the JAR
+### 2. 拓扑结构倾斜（Topology Skew）
 
-To assemble the JAR file with SBT, run:
+| 特性 | 说明 | 关键参数 |
+|---|---|---|
+| 超级节点 | 极小比例 Person 获得海量 knows 边（度数放大 100~10000 倍），模拟社交大 V / 锁竞争热点 | `supernode.rate=0.0001`、`supernode.minExtra`、`supernode.maxExtraDegreeMul` |
+| 热点内容 | 超级节点发布的帖子/评论获得海量点赞、回复、标签边（热点遍历、边拆分调度） | `hotmsg.enabled` |
+| 多尺度连通分量 | 注入大量单点/小规模孤立连通分量（预留 ID 带），测试 WCC、BFS 对碎片化拓扑的适配 | `smallcomp.count`、`smallcomp.cliqueMax` |
+| 社区碎片化 | 随机切断部分 knows 边，打破单一连通图 | `fragment.dropKnowsRatio` |
+| 非对称单向边 | 追加单向 knows 关系，制造异构边分布不均 | `unidir.flipRatio` |
+| R-MAT 子图 | 预留节点带上融合 Graph500 风格幂律子图（PageRank/BFS/SSSP 对比） | `rmat.enabled` |
+
+### 3. 属性 Zipf 长尾倾斜（Attribute Skew)
+
+将 `locationIP`、`browserUsed` 及 Tag 关联边（HasInterest / PostHasTag / CommentHasTag / ForumHasTag）从均匀分布改造为标准 **Zipf 分布**——少数值高频出现、大量值稀疏唯一，测试索引过滤、热点属性缓存命中率：
+
+```ini
+enhance.zipf.enabled = true
+enhance.zipf.s       = 1.1
+enhance.zipf.attrs   = locationIP,browserUsed,tag
+```
+
+### 4. 时序突发负载（Temporal Burst）
+
+- **突发写入**：将部分近期活动的时间戳压缩进短时窗口，模拟热点事件瞬时点赞/发帖爆发（测 WAL 吞吐、事务冲突）；
+- **超级节点点赞风暴**：热帖的点赞时间集中在极小窗口内（MVCC / 分布式锁竞争场景）；
+- **冷热分层**：按比例把活动时间压入「95% 冷数据 / 5% 热数据」两个时间带，模拟存储分层。
+
+```ini
+enhance.burst.enabled   = true
+enhance.burst.ratio     = 0.2
+enhance.hotcold.split   = false
+```
+
+### 5. 异常脏数据注入（Dirty Data）
+
+精准模拟线上数据异常场景，全部占比可调，测试引擎容错、数据校验、脏数据过滤能力：
+
+| 类型 | 注入方式 | 参数 |
+|---|---|---|
+| 空值 | 消息 content / imageFile / language 置 NULL | `dirty.nullContentRatio` |
+| 空串 | 非空字符串属性置 "" | `dirty.emptyContentRatio` |
+| 自环边 | knows 边 P1 == P2 | `dirty.selfLoopRatio` |
+| 重复边 | 完全重复的边行 | `dirty.dupEdgeRatio` |
+| 悬空外键 | likes 指向不存在预留 ID 带 | `dirty.danglingLikeRatio` |
+| 非法值 | 非法 IP `999.999.999.999` | `dirty.invalidIpRatio` |
+| 越界时间 | 时间戳 0 / 2100 年 | `dirty.outOfRangeDateRatio` |
+
+## 快速开始
+
+### 构建
 
 ```bash
-sbt assembly
+# 依赖：JDK 8/11（勿用 17）、sbt、Spark 3.2.x
+./scripts/build.sh          # sbt assembly，产出 jar-with-dependencies
 ```
 
-### Install Python tools
-
-Some of the build utilities are written in Python. To use them, you have to create a Python virtual environment
-and install the dependencies.
-
-E.g. with [pyenv](https://github.com/pyenv/pyenv) and [pyenv-virtualenv](https://github.com/pyenv/pyenv-virtualenv):
+### 运行（原生模式）
 
 ```bash
-pyenv install 3.7.13
-pyenv virtualenv 3.7.13 ldbc_datagen_tools
-pyenv local ldbc_datagen_tools
-pip install -U pip
-pip install ./tools
+spark-submit --class ldbc.snb.datagen.LdbcDatagen \
+  target/scala-2.12/ldbc-snb-datagen_2.12_spark3.2-0.6.0-enhance-jar-with-dependencies.jar \
+  --scale-factor 1 --format csv --mode raw --output-dir out_sf1_native
 ```
 
-If the environment already exists, activate it with:
+### 运行（增强模式）
 
 ```bash
-pyenv activate
+spark-submit --class ldbc.snb.datagen.LdbcDatagen \
+  target/scala-2.12/ldbc-snb-datagen_2.12_spark3.2-0.6.0-enhance-jar-with-dependencies.jar \
+  --scale-factor 1 --format csv --mode raw --output-dir out_sf1_enhanced \
+  --enhance-param-file conf/enhance-defaults.ini
+# 或命令行直接传参：
+#   --enhance-params enhance.enabled=true,enhance.remap.enabled=true,enhance.supernode.rate=0.001
 ```
 
-### Running locally
+- `--enhance-param-file <file>`：增强参数文件（INI 格式 `key=value`），样例见 [conf/enhance-defaults.ini](conf/enhance-defaults.ini)（全关 + 注释文档）；
+- `--enhance-params k=v[,k=v...]`：命令行覆盖，优先级高于参数文件；
+- 未指定时**完全等同原生行为**。
 
-The `./tools/run.py` script is intended for **local runs**. To use it, download and extract Spark as follows.
+### 1TB 级生成（SF1000）
 
-#### Spark 3.2.x
-
-Spark 3.2.x is the recommended runtime to use. The rest of the instructions are provided assuming Spark 3.2.x.
-
-To place Spark under `/opt/`:
+参见 [scripts/gen-sf1000.sh](scripts/gen-sf1000.sh)：先一次性生成原生 IR（parquet），再基于 IR 输出「原生基线」与「增强版」两份 CSV（增强调参只需重跑第二阶段，无需重新生成 IR）。
 
 ```bash
-scripts/get-spark-to-opt.sh
-export SPARK_HOME="/opt/spark-3.2.2-bin-hadoop3.2"
-export PATH="${SPARK_HOME}/bin":"${PATH}"
+./scripts/gen-sf1000.sh            # 全流程：IR 生成 + 双版本输出 + 校验
 ```
 
-To place it under `${HOME}/`:
+### 验证增强特征
 
 ```bash
-scripts/get-spark-to-home.sh
-export SPARK_HOME="${HOME}/spark-3.2.2-bin-hadoop3.2"
-export PATH="${SPARK_HOME}/bin":"${PATH}"
+python3 tools/verify_enhance.py --dir out_sf1_enhanced   # 校验超节点度数、Zipf 直方图、脏数据占比、分区聚集、突发窗口等
 ```
 
-Both Java 8 and Java 11 are supported, but Java 17 is not (Spark 3.2.2 will fail, since it uses internal Java APIs and does not set the permissions appropriately).
+## 增强实现架构
 
-#### Building the project
-
-Run:
-
-```bash
-scripts/build.sh
+```
+GenerationStage（原生，未改动）
+    └── IR: <out>/graphs/parquet/raw/composite-merged-fk/<entity>
+TransformationStage:
+    GraphSource.read(IR)
+      → EnhanceTransform(增强模块，新增)          ← IdRemap → TopologySkew → ZipfSkew → TemporalBurst → DirtyData
+      → ExplodeAttrs → ExplodeEdges → [BI 转换] → ConvertDates → GraphSink(最终 CSV)
 ```
 
-#### Running the generator
+- 增强模块全部基于 Spark DataFrame 表达式 + `xxhash64` 确定性哈希（无 UDF、无窗口排序），可扩展至 SF1000（2.7 亿 Person、18 亿+边）；
+- IR 生成一次后可反复只重跑 TransformationStage 调增强参数；
+- 模块执行顺序固定：分区重映射先行（保证新增边/聚集基于重映射后的 ID），脏数据最后（避免被其它模块"修复"）。
 
-Once you have Spark in place and built the JAR file, run the generator as follows:
+## 兼容性说明
 
-```bash
-export PLATFORM_VERSION=$(sbt -batch -error 'print platformVersion')
-export DATAGEN_VERSION=$(sbt -batch -error 'print version')
-export LDBC_SNB_DATAGEN_JAR=$(sbt -batch -error 'print assembly / assemblyOutputPath')
-./tools/run.py <runtime configuration arguments> -- <generator configuration arguments>
-```
+- 输出 Schema 与官方 LDBC SNB 完全一致（未增加扩展列），兼容官方交互式/BI 查询集与校验规则；
+- 脏数据、悬空外键等特征会**故意**引入规范违规数据——这正是容错评测的测试点，加载器需知晓；
+- 增强特征全部开启时，数据体量相对原生会有一定增长（超级节点边、小组件、R-MAT 子图）。
 
-#### Runtime configuration arguments
+## 原生版本说明（简）
 
-The runtime configuration arguments determine the amount of memory, number of threads, degree of parallelism. For a list of arguments, see:
+原生工具链的完整文档（Docker 镜像、AWS EMR、BI 模式细节、因子表等）参见[上游 README](https://github.com/ldbc/ldbc_snb_datagen_spark)。本仓库常用参数：
 
-```bash
-./tools/run.py --help
-```
+| 参数 | 说明 |
+|---|---|
+| `--scale-factor` | 规模因子（SF1 ≈ 27 万 Person；SF1000 ≈ 2.7 亿） |
+| `--mode raw / bi` | 原始快照 / BI 快照+增量更新流 |
+| `--format csv / parquet` | 输出格式（sep=`\|`，带 header） |
+| `--oversize-factor` | 控制文件大小/数量 |
+| `-n / --num-threads` | 并行度与产出文件数 |
+| `--epoch-millis` | BI 模式时间戳用毫秒 long |
 
-To generate a single `part-*` file, reduce the parallelism (number of Spark partitions) to 1.
-
-```bash
-./tools/run.py --parallelism 1 -- --format csv --scale-factor 0.003 --mode bi
-```
-#### Generator configuration arguments
-
-The generator configuration arguments allow the configuration of the output directory, output format, layout, etc.
-
-To get a complete list of the arguments, pass `--help` to the JAR file:
-
-```bash
-./tools/run.py -- --help
-```
-
-* Generating `csv-composite-merged-fk` files in **BI mode** resulting in compressed `.csv.gz` files:
-
-  ```bash
-  ./tools/run.py -- --format csv --scale-factor 0.003 --mode bi --format-options compression=gzip
-  ```
-
-* Generating `csv-composite-merged-fk` files in **BI mode** and generating factors:
-
-  ```bash
-  ./tools/run.py -- --format csv --scale-factor 0.003 --mode bi --generate-factors
-  ```
-
-* Generating CSVs in **raw mode**:
-
-  ```bash
-  ./tools/run.py -- --format csv --scale-factor 0.003 --mode raw --output-dir sf0.003-raw
-  ```
-
-* Generating Parquet files in **BI mode**:
-
-  ```bash
-  ./tools/run.py -- --format parquet --scale-factor 0.003 --mode bi
-  ```
-
-* Use epoch milliseconds encoded as longs for serializing date and datetime values in **BI mode** (this is equivalent to using the [`LongDateFormatter` in the Hadoop Datagen](https://github.com/ldbc/ldbc_snb_datagen_hadoop/blob/v0.3.8/src/main/java/ldbc/snb/datagen/util/formatter/LongDateFormatter.java)):
-
-  ```bash
-  ./tools/run.py -- --format csv --scale-factor 0.003 --mode bi --epoch-millis
-  ```
-
-* For the **BI mode**, the `--format-options` argument allows passing formatting options such as timestamp/date formats, the presence/abscence of headers (see the [Spark formatting options](https://spark.apache.org/docs/2.4.8/api/scala/index.html#org.apache.spark.sql.DataFrameWriter) for details), and whether quoting the fields in the CSV required:
-
-  ```bash
-  ./tools/run.py -- --format csv --scale-factor 0.003 --mode bi --format-options timestampFormat=MM/dd/y\ HH:mm:ss,dateFormat=MM/dd/y,header=false,quoteAll=true
-  ```
-
-* The `--explode-attrs` argument implies one of the `csv-singular-{projected-fk,merged-fk}` formats, which has separate files to store multi-valued attributes (`email`, `speaks`).
-
-  ```bash
-  ./tools/run.py -- --format csv --scale-factor 0.003 --mode bi --explode-attrs
-  ```
-
-* The `--explode-edges` argument implies one of the `csv-{composite,singular}-projected-fk` formats, which has separate files to store many-to-one edges (e.g. `Person_isLocatedIn_City`, `Tag_hasType_TagClass`, etc.).
-
-  ```bash
-  ./tools/run.py -- --format csv --scale-factor 0.003 --mode bi --explode-edges
-  ```
-
-* The `--explode-attrs`  and `--explode-edges` arguments together imply the `csv-singular-projected-fk` format:
-
-  ```bash
-  ./tools/run.py -- --format csv --scale-factor 0.003 --mode bi --explode-attrs --explode-edges
-  ```
-
-To change the Spark configuration directory, adjust the `SPARK_CONF_DIR` environment variable.
-
-A complex example:
-
-```bash
-export SPARK_CONF_DIR=./conf
-./tools/run.py --parallelism 4 --memory 8G -- --format csv --format-options timestampFormat=MM/dd/y\ HH:mm:ss,dateFormat=MM/dd/y --explode-edges --explode-attrs --mode bi --scale-factor 0.003
-```
-
-It is also possible to pass a parameter file:
-
-```bash
-./tools/run.py -- --format csv --param-file params.ini
-```
-
-### Docker images
-
-SNB Datagen images are available via [Docker Hub](https://hub.docker.com/orgs/ldbc/repositories).
-The image tags follow the pattern `${DATAGEN_VERSION/+/-}-${PLATFORM_VERSION}`, e.g `ldbc/datagen-standalone:0.5.0-2.12_spark3.2`.
-
-When building images ensure that you [use BuildKit](https://docs.docker.com/develop/develop-images/build_enhancements/#to-enable-buildkit-builds).
-
-#### Standalone Docker image
-
-The standalone image bundles Spark with the JAR and Python helpers, so you can run a workload in a container similarly to a local run, as you can
-see in this example:
-
-```bash
-export SF=0.003
-mkdir -p out_sf${SF}_bi   # create output directory
-docker run \
-    --mount type=bind,source="$(pwd)"/out_sf${SF}_bi,target=/out \
-    --mount type=bind,source="$(pwd)"/conf,target=/conf,readonly \
-    -e SPARK_CONF_DIR=/conf \
-    ldbc/datagen-standalone:${DATAGEN_VERSION/+/-}-${PLATFORM_VERSION} \
-    --parallelism 1 \
-    -- \
-    --format csv \
-    --scale-factor ${SF} \
-    --mode bi \
-    --generate-factors
-```
-
-The standalone Docker image can be built with the provided Dockerfile. To build, execute the following command from the repository directory:
-
-```bash
-export PLATFORM_VERSION=$(sbt -batch -error 'print platformVersion')
-export DATAGEN_VERSION=$(sbt -batch -error 'print version')
-export DOCKER_BUILDKIT=1
-docker build . --target=standalone -t ldbc/datagen-standalone:${DATAGEN_VERSION/+/-}-${PLATFORM_VERSION}
-```
-
-#### JAR-only image
-
-The `ldbc/datagen-jar` image contains the assembly JAR, so it can bundled in your custom container:
-
-```docker
-FROM my-spark-image
-ARG VERSION
-COPY --from=ldbc/datagen-jar:${VERSION} /jar /lib/ldbc-datagen.jar
-```
-
-The JAR-only Docker image can be built with the provided Dockerfile. To build, execute the following command from the repository directory:
-
-```bash
-docker build . --target=jar -t ldbc/datagen-jar:${DATAGEN_VERSION/+/-}-${PLATFORM_VERSION}
-```
-
-#### Pushing to Docker Hub
-
-To release a new snapshot version on Docker Hub, run:
-
-```bash
-docker tag ldbc/datagen-jar:${DATAGEN_VERSION/+/-}-${PLATFORM_VERSION} ldbc/datagen-jar:latest
-docker push ldbc/datagen-jar:${DATAGEN_VERSION/+/-}-${PLATFORM_VERSION}
-docker push ldbc/datagen-jar:latest
-docker tag ldbc/datagen-standalone:${DATAGEN_VERSION/+/-}-${PLATFORM_VERSION} ldbc/datagen-standalone:latest
-docker push ldbc/datagen-standalone:${DATAGEN_VERSION/+/-}-${PLATFORM_VERSION}
-docker push ldbc/datagen-standalone:latest
-```
-
-To release a new stable version, create a new Git tag (e.g. by creating a new release on GitHub), then build the Docker image and push it.
-
-### Elastic MapReduce
-
-We provide scripts to run Datagen on AWS EMR. See the README in the [`./tools/emr`](tools/emr) directory for details.
-
-## Graph schema
-
-The graph schema is as follows:
+图 Schema 与官方一致：
 
 ![](https://raw.githubusercontent.com/ldbc/ldbc_snb_docs/dev/figures/schema-comfortable.png)
 
 ## Troubleshooting
 
-* When running the tests, they might throw a `java.net.UnknownHostException: your_hostname: your_hostname: Name or service not known` coming from `org.apache.hadoop.mapreduce.JobSubmitter.submitJobInternal`. The solution is to add an entry of your machine's hostname to the `/etc/hosts` file: `127.0.1.1 your_hostname`.
-* If you are using Docker and Spark runs out of space, make sure that Docker has enough space to store its containers. To move the location of the Docker containers to a larger disk, stop Docker, edit (or create) the `/etc/docker/daemon.json` file and add `{ "data-root": "/path/to/new/docker/data/dir" }`, then sync the old folder if needed, and restart Docker. (See [more detailed instructions](https://www.guguweb.com/2019/02/07/how-to-move-docker-data-directory-to-another-location-on-ubuntu/)).
-* If you are using a local Spark installation and run out of space in `/tmp` (`java.io.IOException: No space left on device`), set the `SPARK_LOCAL_DIRS` to point to a directory with enough free space.
-* The Docker image may throw the following error when generating factors `java.io.FileNotFoundException: /tmp/blockmgr-.../.../temp_shuffle_... (No file descriptors available)`. This error occurs on Fedora 36 host machines. Changing to an Ubuntu 22.04 host machine resolves the problem. Related issue: [#420](https://github.com/ldbc/ldbc_snb_datagen_spark/issues/420).
+* 本地运行报 `java.net.UnknownHostException: <hostname>`：把 `<hostname>` 加进 `/etc/hosts`（`127.0.1.1 <hostname>`）。
+* Spark 磁盘不足：设置 `SPARK_LOCAL_DIRS` 指向大容量磁盘目录。
+* SF1000 本地生成内存不足：提高 `--driver-memory` 并增大 `spark.sql.shuffle.partitions`（参考 `scripts/gen-sf1000.sh`）。
