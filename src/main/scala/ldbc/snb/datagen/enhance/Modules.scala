@@ -535,7 +535,122 @@ object ZipfSkew extends Logging {
 
 /** F5: temporal burst windows and hot/cold data split. */
 object TemporalBurst extends Logging {
-  def transform(g: RawGraph, cfg: EnhanceConfig): RawGraph = g
+
+  import org.apache.spark.sql.functions.broadcast
+
+  private val DayMillis = 86400000L
+
+  private val Messages = Seq("Post", "Comment")
+
+  def transform(g: RawGraph, cfg: EnhanceConfig): RawGraph = {
+    if (!cfg.burstEnabled && !cfg.hotcoldSplit && !cfg.supernodeLikeBurstEnabled) g
+    else {
+      val g1 =
+        if (cfg.burstEnabled || cfg.hotcoldSplit)
+          Messages.foldLeft(g)((graph, name) => burstMessages(graph, name, cfg))
+        else g
+      val g2 = if (cfg.supernodeLikeBurstEnabled) burstSupernodeLikes(g1, cfg) else g1
+      log.info(s"enhance.TemporalBurst: applied (burst=${cfg.burstEnabled} hotcoldSplit=${cfg.hotcoldSplit} " +
+        s"supernodeLikeBurst=${cfg.supernodeLikeBurstEnabled})")
+      g2
+    }
+  }
+
+  /**
+    * Burst-window creation date for an entity id: window `bw` of the last
+    * `recentDays` days (split into `windowCount` windows), offset `bo` inside
+    * the window, clamped to the simulation end.
+    */
+  private def burstCdExpr(id: Column, end0: Long, cfg: EnhanceConfig): Column = {
+    val recentSpan = cfg.burstRecentDays.toLong * DayMillis
+    val step       = math.max(1L, recentSpan / math.max(1, cfg.burstWindowCount.toLong))
+    val winStart   = lit(end0 - recentSpan) +
+      Hashes.hashMod(id, lit("bw"), lit(cfg.salt))(cfg.burstWindowCount) * lit(step)
+    least(winStart + Hashes.hashMod(id, lit("bo"), lit(cfg.salt))(cfg.burstWindowMillis), lit(end0))
+  }
+
+  /**
+    * Re-dates Post/Comment creation times:
+    *  - hotcoldSplit: a `hotcoldHotRatio` hash sample is compressed into the
+    *    last 10% of the entity's [min creation, max deletion] span;
+    *  - burstEnabled: a `burstRatio` hash sample is re-dated into the burst
+    *    windows inside the last `recentDays` days.
+    * Burst is applied after hot/cold, so burst wins on overlap. Non-selected
+    * rows keep their original dates untouched; deletionDate is only pushed
+    * forward (greatest) so it always stays >= creationDate + 1 day.
+    */
+  private def burstMessages(g: RawGraph, name: String, cfg: EnhanceConfig): RawGraph = {
+    val (tpe, df) = entity(g, name)
+      .getOrElse(throw new IllegalStateException(s"enhance.TemporalBurst: $name entity missing"))
+    val bounds = df.agg(min(col("creationDate")), max(col("deletionDate"))).head()
+    val start0 = bounds.getLong(0)
+    val end0   = bounds.getLong(1)
+    val id     = col("id")
+
+    var newCd = col("creationDate")
+    var newDd = col("deletionDate")
+    if (cfg.hotcoldSplit) {
+      val span    = math.max(end0 - start0, DayMillis)
+      val hotSpan = math.max(span / 10, 1L)
+      val hotCd   = lit(end0 - hotSpan) + Hashes.hashMod(id, lit("ho"), lit(cfg.salt))(hotSpan)
+      val isHot   = Hashes.hash01(id, lit("hotcold"), lit(cfg.salt)) < lit(cfg.hotcoldHotRatio)
+      newCd = when(isHot, hotCd).otherwise(newCd)
+      newDd = when(isHot, greatest(newDd, hotCd + lit(DayMillis))).otherwise(newDd)
+    }
+    if (cfg.burstEnabled) {
+      val bCd   = burstCdExpr(id, end0, cfg)
+      val isBur = Hashes.hash01(id, lit("burst"), lit(cfg.salt)) < lit(cfg.burstRatio)
+      newCd = when(isBur, bCd).otherwise(newCd)
+      newDd = when(isBur, greatest(newDd, bCd + lit(DayMillis))).otherwise(newDd)
+    }
+
+    val out = df.select(df.columns.map {
+      case "creationDate" => newCd.as("creationDate")
+      case "deletionDate" => newDd.as("deletionDate")
+      case other          => col(other)
+    }: _*)
+    log.info(s"enhance.TemporalBurst: $name re-dated (data span [$start0, $end0])")
+    replace(g, tpe, out)
+  }
+
+  /**
+    * Likes on hot posts (posts created by supernodes) are re-dated into the
+    * burst windows, modelling like storms arriving in bursts. The supernode
+    * set is recomputed with the same deterministic formula as TopologySkew,
+    * so the result does not depend on whether TopologySkew ran. Non-hot rows
+    * are untouched (left join + isNotNull guard).
+    */
+  private def burstSupernodeLikes(g: RawGraph, cfg: EnhanceConfig): RawGraph = {
+    val name = "Person -[Likes]-> Post"
+    val (tpe, likes) = entity(g, name)
+      .getOrElse(throw new IllegalStateException(s"enhance.TemporalBurst: $name entity missing"))
+    val (_, posts) = entity(g, "Post")
+      .getOrElse(throw new IllegalStateException("enhance.TemporalBurst: Post entity missing"))
+    val (_, persons) = entity(g, "Person")
+      .getOrElse(throw new IllegalStateException("enhance.TemporalBurst: Person entity missing"))
+
+    val ctx = IdRemap.ctxOf(cfg)
+    val s = persons
+      .where(col("id") < lit(ctx.m))
+      .where(Hashes.hashMod(col("id"), lit(cfg.salt))(10000) < lit(cfg.supernodeRate * 10000))
+      .select(col("id").as("sid"))
+
+    val end0 = posts.agg(max(col("deletionDate"))).head().getLong(0)
+    val hotPosts = posts.join(broadcast(s), col("CreatorPersonId") === col("sid"))
+      .select(col("id").as("hpid"))
+    val bCd   = burstCdExpr(col("PostId"), end0, cfg)
+    val isHot = col("hpid").isNotNull
+    val out = likes.join(broadcast(hotPosts), col("PostId") === col("hpid"), "left")
+      .select(likes.columns.map {
+        case "creationDate" => when(isHot, bCd).otherwise(col("creationDate")).as("creationDate")
+        case "deletionDate" =>
+          when(isHot, greatest(col("deletionDate"), bCd + lit(DayMillis)))
+            .otherwise(col("deletionDate")).as("deletionDate")
+        case other => col(other)
+      }: _*)
+    log.info("enhance.TemporalBurst: bursted likes on supernode posts")
+    replace(g, tpe, out)
+  }
 }
 
 /** F6: dirty data injection (nulls, self-loops, duplicates, dangling FKs, invalid values). */
