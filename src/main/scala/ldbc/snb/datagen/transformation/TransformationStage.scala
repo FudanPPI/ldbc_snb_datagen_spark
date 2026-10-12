@@ -1,5 +1,6 @@
 package ldbc.snb.datagen.transformation
 
+import ldbc.snb.datagen.enhance.{EnhanceConfig, EnhanceTransform}
 import ldbc.snb.datagen.io.graphs.{GraphSink, GraphSource}
 import ldbc.snb.datagen.model
 import ldbc.snb.datagen.model.{BatchedEntity, Graph, Mode}
@@ -21,7 +22,8 @@ object TransformationStage extends DatagenStage with Logging {
       irFormat: String = "parquet",
       format: String = "csv",
       formatOptions: Map[String, String] = Map.empty,
-      epochMillis: Boolean = false
+      epochMillis: Boolean = false,
+      enhance: EnhanceConfig = EnhanceConfig()
   )
 
   override type ArgsType = Args
@@ -51,6 +53,7 @@ object TransformationStage extends DatagenStage with Logging {
     type Out = Graph[Mode.Raw.type] :+: Graph[Mode.BI] :+: CNil
 
     GraphSource(model.graphs.Raw.graphDef, args.outputDir, args.irFormat).read
+      .pipeFoldLeft(args.enhance.enabled.fork)((graph, _: Unit) => EnhanceTransform(args.enhance).transform(graph))
       .pipeFoldLeft(args.explodeAttrs.fork)((graph, _: Unit) => ExplodeAttrs.transform(graph))
       .pipeFoldLeft(args.explodeEdges.fork)((graph, _: Unit) => ExplodeEdges.transform(graph))
       .pipe[Out] { g =>

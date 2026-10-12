@@ -30,7 +30,9 @@ object LdbcDatagen extends SparkApp {
       oversizeFactor: Option[Double] = None,
       epochMillis: Boolean = false,
       generateFactors: Boolean = false,
-      factorFormat: String = "parquet"
+      factorFormat: String = "parquet",
+      enhanceParams: Map[String, String] = Map.empty,
+      enhanceParamFile: Option[String] = None
   )
 
   override type ArgsType = Args
@@ -123,6 +125,17 @@ object LdbcDatagen extends SparkApp {
         .action((x, c) => args.factorFormat.set(c)(x))
         .text("Output format of factor tables")
 
+      opt[Map[String, String]]("enhance-params")
+        .action((x, c) => args.enhanceParams.set(c)(x))
+        .text(
+          "Skew-enhancement parameters passed as key=value1[,key=value...]. " +
+            "All keys must be prefixed with 'enhance.'. Takes precedence over --enhance-param-file"
+        )
+
+      opt[String]("enhance-param-file")
+        .action((x, c) => args.enhanceParamFile.set(c)(Some(x)))
+        .text("Parameter file for the skew-enhancement modules (see conf/enhance-defaults.ini)")
+
       help('h', "help").text("prints this usage text")
 
       opt[Unit]("epoch-millis")
@@ -159,6 +172,11 @@ object LdbcDatagen extends SparkApp {
       FactorGenerationStage.run(factorArgs)
     }
 
+    val enhanceConfig = ldbc.snb.datagen.enhance.EnhanceConfig.load(args.enhanceParamFile, args.enhanceParams) match {
+      case Right(c)   => c
+      case Left(errs) => throw new RuntimeException(s"Invalid enhance configuration: $errs")
+    }
+
     val transformArgs = TransformationStage.Args(
       outputDir = args.outputDir,
       explodeEdges = args.explodeEdges,
@@ -173,7 +191,8 @@ object LdbcDatagen extends SparkApp {
       irFormat,
       args.format,
       args.formatOptions,
-      args.epochMillis
+      args.epochMillis,
+      enhance = enhanceConfig
     )
 
     TransformationStage.run(transformArgs)
