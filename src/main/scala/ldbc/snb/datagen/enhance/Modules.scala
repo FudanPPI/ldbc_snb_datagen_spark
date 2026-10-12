@@ -467,9 +467,70 @@ object TopologySkew extends Logging {
     entity(g, name).getOrElse(throw new IllegalStateException(s"enhance.TopologySkew: $name entity missing"))._1
 }
 
-/** F4: Zipf long-tail for attribute values and tag assignments. */
+/** F4: zipf attribute skew – rewrites attribute values so their distribution follows a Zipf law. */
 object ZipfSkew extends Logging {
-  def transform(g: RawGraph, cfg: EnhanceConfig): RawGraph = g
+
+  import org.apache.spark.sql.functions.broadcast
+
+  def transform(g: RawGraph, cfg: EnhanceConfig): RawGraph = {
+    if (cfg.zipfAttrs.isEmpty) {
+      log.warn("enhance.ZipfSkew: enabled but no attributes configured (enhance.zipf.attrs)")
+      g
+    } else {
+      cfg.zipfAttrs.toSeq.sorted.foldLeft(g)((graph, attr) => applyAttr(graph, attr, cfg))
+    }
+  }
+
+  private def applyAttr(g: RawGraph, attr: String, cfg: EnhanceConfig): RawGraph = {
+    val updates = for {
+      (tpe, df) <- g.entities.toSeq
+      if df.columns.contains(attr)
+    } yield tpe -> zipfColumn(df, attr, cfg)
+    log.info(s"enhance.ZipfSkew: applied zipf skew to attribute '$attr' on ${updates.size} entities")
+    replaceAll(g, updates)
+  }
+
+  /**
+    * Replaces `attr` with a value drawn from the original distinct set under a
+    * Zipf (rank+1)^-s law. The value set is materialized on the driver (low
+    * cardinality attributes), bucketed into an equal-width bucket -> value
+    * table and broadcast-joined back on a hash of the entity id, keeping the
+    * main dataflow shuffle-free and fully deterministic.
+    */
+  private def zipfColumn(df: DataFrame, attr: String, cfg: EnhanceConfig): DataFrame = {
+    val spark = df.sparkSession
+    import spark.implicits._
+    val values = df.select(col(attr)).where(col(attr).isNotNull).distinct().as[String].collect().sorted
+    if (values.length <= 1) {
+      log.info(s"enhance.ZipfSkew: '$attr' has ${values.length} distinct value(s); skipped")
+      return df
+    }
+    val n        = values.length
+    val bktCount = math.min(math.max(n * 2L, 16L), cfg.zipfBuckets).toInt
+    // prefix sums of the zipf weights w(rank) = 1 / (rank+1)^s
+    val cum = new Array[Double](n)
+    var acc = 0.0
+    for (i <- 0 until n) { acc += 1.0 / math.pow(i + 1, cfg.zipfS); cum(i) = acc }
+    val total = acc
+    val rows = (0 until bktCount).iterator.map { b =>
+      val u = (b + 0.5) / bktCount.toDouble * total
+      val idx = java.util.Arrays.binarySearch(cum, u) match {
+        case x if x >= 0 => x               // exact prefix-sum hit
+        case x           => math.min(-x - 1, n - 1) // first prefix sum > u
+      }
+      (b.toLong, values(idx))
+    }.toSeq
+    val bucketDf  = spark.createDataFrame(rows).toDF("bkt", "zv")
+    val bkt = least(
+      floor(Hashes.hash01(col("id"), lit(s"$attr-zipf"), lit(cfg.salt)) * lit(bktCount.toDouble)),
+      lit(bktCount - 1L)
+    )
+    df.join(broadcast(bucketDf), bkt === col("bkt"), "left")
+      .select(df.columns.map {
+        case `attr` => when(col(attr).isNotNull, col("zv")).otherwise(col(attr)).as(attr)
+        case other  => col(other)
+      }: _*)
+  }
 }
 
 /** F5: temporal burst windows and hot/cold data split. */
