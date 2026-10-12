@@ -655,5 +655,103 @@ object TemporalBurst extends Logging {
 
 /** F6: dirty data injection (nulls, self-loops, duplicates, dangling FKs, invalid values). */
 object DirtyData extends Logging {
-  def transform(g: RawGraph, cfg: EnhanceConfig): RawGraph = g
+
+  private val Messages = Seq("Post", "Comment")
+
+  /** Reserved-band base (bucket 253) for deterministic dangling message ids. */
+  private val DanglingBase = 253L << 36
+
+  def transform(g: RawGraph, cfg: EnhanceConfig): RawGraph = {
+    val onAttrs = cfg.dirtyNullContentRatio > 0 || cfg.dirtyEmptyContentRatio > 0 ||
+      cfg.dirtyInvalidIpRatio > 0 || cfg.dirtyOutOfRangeDateRatio > 0
+    val onKnows = cfg.dirtySelfLoopRatio > 0 || cfg.dirtyDupEdgeRatio > 0
+    if (!onAttrs && !onKnows && cfg.dirtyDanglingLikeRatio <= 0) g
+    else {
+      val g1 = if (onAttrs) Messages.foldLeft(g)((gr, name) => dirtyMessages(gr, name, cfg)) else g
+      val g2 = if (onKnows) dirtyKnows(g1, cfg) else g1
+      val g3 = if (cfg.dirtyDanglingLikeRatio > 0) dirtyLikes(g2, cfg) else g2
+      log.info("enhance.DirtyData: applied dirty data injection")
+      g3
+    }
+  }
+
+  /**
+    * Attribute dirt on Post/Comment: null/empty content, invalid locationIP,
+    * out-of-range creationDate. All selections are hash samples of the entity
+    * id; ids themselves are never touched, so joins stay intact.
+    */
+  private def dirtyMessages(g: RawGraph, name: String, cfg: EnhanceConfig): RawGraph = {
+    val (tpe, df) = entity(g, name)
+      .getOrElse(throw new IllegalStateException(s"enhance.DirtyData: $name entity missing"))
+    val id = col("id")
+    val exprs: Seq[Column] = df.columns.map {
+      case "content" =>
+        var c = col("content")
+        if (cfg.dirtyNullContentRatio > 0)
+          c = when(Hashes.chance(id, lit("dirty-null"), lit(cfg.salt))(cfg.dirtyNullContentRatio),
+            lit(null).cast("string")).otherwise(c)
+        if (cfg.dirtyEmptyContentRatio > 0)
+          c = when(Hashes.chance(id, lit("dirty-empty"), lit(cfg.salt))(cfg.dirtyEmptyContentRatio),
+            lit("")).otherwise(c)
+        c.as("content")
+      case "locationIP" if cfg.dirtyInvalidIpRatio > 0 =>
+        when(Hashes.chance(id, lit("dirty-ip"), lit(cfg.salt))(cfg.dirtyInvalidIpRatio),
+          lit("999.999.999.999")).otherwise(col("locationIP")).as("locationIP")
+      case "creationDate" if cfg.dirtyOutOfRangeDateRatio > 0 =>
+        when(Hashes.chance(id, lit("dirty-date"), lit(cfg.salt))(cfg.dirtyOutOfRangeDateRatio),
+          lit(0L)).otherwise(col("creationDate")).as("creationDate")
+      case other => col(other)
+    }
+    log.info(s"enhance.DirtyData: dirtied attributes of $name")
+    replace(g, tpe, df.select(exprs: _*))
+  }
+
+  /**
+    * Knows-edge dirt: hash-selected edges collapse into self-loops (P2 := P1)
+    * in place; a further hash sample of the (possibly looped) edges is
+    * duplicated verbatim, so duplicate rows appear in the output.
+    */
+  private def dirtyKnows(g: RawGraph, cfg: EnhanceConfig): RawGraph = {
+    val name = "Person -[Knows]-> Person"
+    val (tpe, knows) = entity(g, name)
+      .getOrElse(throw new IllegalStateException(s"enhance.DirtyData: $name entity missing"))
+    var out = knows
+    if (cfg.dirtySelfLoopRatio > 0) {
+      out = out.select(out.columns.map {
+        case "Person2Id" =>
+          when(Hashes.chance(col("Person1Id"), lit("dirty-loop"), lit(cfg.salt))(cfg.dirtySelfLoopRatio),
+            col("Person1Id")).otherwise(col("Person2Id")).as("Person2Id")
+        case other => col(other)
+      }: _*)
+      log.info(s"enhance.DirtyData: self-loops injected (ratio ${cfg.dirtySelfLoopRatio})")
+    }
+    if (cfg.dirtyDupEdgeRatio > 0) {
+      val dup = out.where(
+        Hashes.chance(col("Person1Id"), col("Person2Id"), lit("dirty-dup"), lit(cfg.salt))(cfg.dirtyDupEdgeRatio))
+      out = out.unionByName(dup.select(out.columns.map(col): _*))
+      log.info(s"enhance.DirtyData: duplicate edges appended (ratio ${cfg.dirtyDupEdgeRatio})")
+    }
+    replace(g, tpe, out)
+  }
+
+  /**
+    * Dangling likes: hash-selected like rows are re-pointed at a message id in
+    * the reserved bucket-253 band that the generator never allocates, producing
+    * guaranteed-dangling FKs without any lookup joins.
+    */
+  private def dirtyLikes(g: RawGraph, cfg: EnhanceConfig): RawGraph =
+    Seq("Person -[Likes]-> Post", "Person -[Likes]-> Comment").foldLeft(g) { (gr, name) =>
+      val (tpe, likes) = entity(gr, name)
+        .getOrElse(throw new IllegalStateException(s"enhance.DirtyData: $name entity missing"))
+      val fk = if (name.endsWith("Post")) "PostId" else "CommentId"
+      val dirty = likes.select(likes.columns.map {
+        case `fk` =>
+          when(Hashes.chance(col("PersonId"), col(fk), lit("dirty-dangle"), lit(cfg.salt))(cfg.dirtyDanglingLikeRatio),
+            lit(DanglingBase) + Hashes.hashMod(col("PersonId"), col(fk), lit("dirty-dangle2"), lit(cfg.salt))(1L << 36))
+            .otherwise(col(fk)).as(fk)
+        case other => col(other)
+      }: _*)
+      log.info(s"enhance.DirtyData: dangling FKs injected into $name (ratio ${cfg.dirtyDanglingLikeRatio})")
+      replace(gr, tpe, dirty)
+    }
 }
