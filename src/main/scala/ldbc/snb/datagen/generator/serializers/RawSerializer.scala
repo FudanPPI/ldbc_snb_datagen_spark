@@ -24,9 +24,16 @@ class RawSerializer(ranker: SparkRanker)(implicit spark: SparkSession) extends W
   private def writeDynamicSubgraph(persons: RDD[Person], sink: RawSink): Unit = {
 
     val blockSize = DatagenParams.blockSize
+    // One reduce partition per block: groupByKey() without an explicit count
+    // collapses to spark.default.parallelism (a few dozen tasks), so at SF1000
+    // each task aggregates ~22 blocks (~220k full Person objects w/ knows edges)
+    // and OOMs while spilling the per-key CompactBuffer. Partitioning by the
+    // block count keeps a whole block co-located (generateActivityForBlock needs
+    // it) while bounding each task to one block (blockSize persons).
+    val numBlocks = Math.ceil(DatagenParams.numPersons / blockSize.toDouble).toInt
     val blocks = ranker(persons)
       .map { case (k, v) => (k / blockSize, v) }
-      .groupByKey()
+      .groupByKey(numBlocks)
 
     val job = RawSerializationJobContext(persons.sparkContext.hadoopConfiguration, sink, "dynamic")
 
