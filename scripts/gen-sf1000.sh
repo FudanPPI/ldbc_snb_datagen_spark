@@ -14,14 +14,22 @@
 # host, 75g heap keeps total RSS ~90G, leaving headroom for the OS and any
 # other work — with 90g heap the kernel OOM-killed the run once.
 #
-# Concurrency sizing: each task holds one parquet writer per entity file
-# (~14 files/task), so 60 threads opened ~840 writers at once, saturating
-# the execution-memory pool (271 "exceeds 95% of heap" warnings) and
-# thrashing GC into a multi-hour hang before the second kernel OOM kill.
-# 32 threads halves the writer burst (~450) — this is the root-cause fix,
-# not the heap size. The sync loop below additionally caps dirty page cache
-# buildup (default vm.dirty_ratio allows ~25G on 125G RAM) from TB-scale
-# writes landing on top of the ~88G JVM RSS.
+# Three prior runs taught us:
+#   1. 90g heap + docker build in parallel → kernel OOM (RSS 104g)
+#   2. 75g heap, 60 threads → 840 concurrent parquet writers saturate exec
+#      memory pool, thrash GC into a 5-hour hang, then kernel OOM fallback
+#      (271 "exceeds 95% of heap" warnings)
+#   3. 75g heap, 32 threads → writer burst tamed, zero heap-exceed warnings,
+#      but Old Gen still hits 99.99% full with 320 Full GCs — the working
+#      set simply does not fit on 75g GC-managed heap at SF1000 scale.
+#
+# Fix (this run): move execution memory off-heap via Spark's off-heap pool.
+# Old Gen now holds only Spark metadata + broadcast vars (small), while
+# shuffle data, broadcast payloads, and parquet writer buffers live in a
+# 15g off-heap region that bypasses GC entirely. Memory fraction 0.75
+# inside the heap expands the execution pool within GC-managed space.
+# Shuffle partitions doubled to 1920 so each task holds less transient data.
+# Concurrency stays at 32 and the dirty-page sync loop is kept from run #2.
 #
 # The output directory must not exist (refuses to overwrite a terabyte run).
 # With --verify, scripts/verify_enhance.py runs after generation succeeds.
@@ -42,7 +50,8 @@ JAVA_HOME=${JAVA_HOME:-$HOME/.local/jdk}
 SPARK_HOME=${SPARK_HOME:-$HOME/.local/opt/spark-3.2.2-bin-hadoop3.2}
 THREADS=${THREADS:-32}
 DRIVER_MEM=${DRIVER_MEM:-75g}
-SHUFFLE_PARTS=${SHUFFLE_PARTS:-960}
+SHUFFLE_PARTS=${SHUFFLE_PARTS:-1920}
+OFFHEAP_SIZE=${OFFHEAP_SIZE:-15g}
 LOG=${LOG:-/tmp/sf1000-gen.log}
 export JAVA_HOME PATH="$JAVA_HOME/bin:$PATH"
 
@@ -68,6 +77,9 @@ echo "    log:    $LOG"
   --conf spark.local.dir="$SPARK_LOCAL_DIR" \
   --conf spark.shuffle.partitions="$SHUFFLE_PARTS" \
   --conf spark.sql.shuffle.partitions="$SHUFFLE_PARTS" \
+  --conf spark.memory.fraction=0.75 \
+  --conf spark.memory.offHeap.enabled=true \
+  --conf spark.memory.offHeap.size="$OFFHEAP_SIZE" \
   --conf spark.ui.showConsoleProgress=false \
   --conf spark.driver.maxResultSize=8g \
   --class ldbc.snb.datagen.LdbcDatagen \
