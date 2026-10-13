@@ -128,12 +128,30 @@ spark-submit --class ldbc.snb.datagen.LdbcDatagen \
 
 ### 1TB 级生成（SF1000）
 
-参见 [scripts/gen-sf1000.sh](scripts/gen-sf1000.sh)：单机大内存直出全流程（60 线程 / 90g driver / 960 shuffle 分区 / oversize-factor 4），参数文件 [conf/enhance-sf1000.ini](conf/enhance-sf1000.ini)。脚本拒绝覆盖已存在的输出目录，可选生成后自动校验：
+SF1000 规模下单阶段直出时，merged knows 边集（约 10.5 亿条）会占满 Old Gen
+触发 GC 死亡螺旋（详见 [scripts/gen-sf1000-two-phase.sh](scripts/gen-sf1000-two-phase.sh)
+头注释的失败分析）。推荐两阶段生成——每阶段独占整个堆：
 
 ```bash
-./scripts/gen-sf1000.sh /path/to/sf1000-out            # 全流程生成
-./scripts/gen-sf1000.sh /path/to/sf1000-out --verify    # 生成 + 结构校验
+./scripts/gen-sf1000-two-phase.sh /path/to/sf1000-out --verify
 ```
+
+- **Phase 1**：GenerationStage 产出原生 IR（parquet）→ `<out>/native/`；
+  knows 合并集以 `MEMORY_AND_DISK` 持久化，内存不足自动 spill 落盘；
+- **Phase 2**：`--skip-generation --input-dir <out>/native` 仅运行
+  TransformationStage（IdRemap → TopologySkew → Zipf → Burst → DirtyData）
+  → `<out>/enhanced/`；
+- `--verify`：结束后自动运行 Spark 版结构校验
+  （[scripts/verify_enhance_spark.py](scripts/verify_enhance_spark.py)）。
+
+默认 64GB 内存预算（24 线程 / 50g driver 堆 + 10g off-heap / 2400 shuffle
+分区），可用环境变量覆盖：`THREADS`、`DRIVER_MEM`、`OFFHEAP_SIZE`、
+`SHUFFLE_PARTS`、`SCALE_FACTOR`、`ENHANCE_PARAM_FILE`（默认
+[conf/enhance-sf1000.ini](conf/enhance-sf1000.ini)）。SF100 已完成全流程
+64GB 预算验证。
+
+单阶段脚本 [scripts/gen-sf1000.sh](scripts/gen-sf1000.sh) 保留作为参考
+（历次 OOM 调优记录见脚本头注释），大规模生成请使用两阶段脚本。
 
 ### 验证增强特征
 
@@ -141,6 +159,12 @@ spark-submit --class ldbc.snb.datagen.LdbcDatagen \
 python3 scripts/verify_enhance.py <enhanced-output-dir> [native-output-dir]
 # 校验：预留带 Person 数、超级节点度数偏斜、热点回复、突发窗口、脏数据痕迹、
 #       Zipf 偏斜、FK 完整性（故意脏行除外）、与原生基线的行数对照
+```
+
+SF1000 等大规模输出使用 Spark 版校验（行式版需全量读内存，仅适合 SF≤100）：
+
+```bash
+spark-submit scripts/verify_enhance_spark.py <enhanced-output-dir> --quick
 ```
 
 ## 增强实现架构

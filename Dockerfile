@@ -42,6 +42,7 @@ COPY tools/run.py /opt/datagen/run.py
 # skew-enhancement assets: parameter files, structural verifier, docs
 COPY conf /opt/enhance/conf
 COPY scripts/verify_enhance.py /opt/enhance/scripts/verify_enhance.py
+COPY scripts/verify_enhance_spark.py /opt/enhance/scripts/verify_enhance_spark.py
 COPY docs/ENHANCE.md /opt/enhance/docs/ENHANCE.md
 COPY scripts/datagen-entrypoint.sh /usr/local/bin/datagen-entrypoint
 RUN chmod +x /usr/local/bin/datagen-entrypoint

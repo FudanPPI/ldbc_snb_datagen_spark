@@ -136,10 +136,33 @@ Enable features by flipping knobs in the ini (or appending
 `--enhance-params enhance.enabled=true,...`). Change `enhance.salt` to
 produce a different but equally deterministic variant.
 
+### Two-phase generation (large scale)
+
+At SF1000 the merged knows edge list (~1.05B rows) cannot stay in heap; the
+GenerationStage therefore persists it with `MEMORY_AND_DISK` (spills to
+`spark.local.dir`). To keep a bounded memory budget, run the two stages
+separately so each owns the whole heap:
+
+```bash
+# Phase 1: native IR only (parquet)
+spark-submit --class ldbc.snb.datagen.LdbcDatagen datagen.jar \
+  --scale-factor 1000 -f csv -n 24 --output-dir out/native --skip-transformation
+# Phase 2: enhance-only transform from the IR
+spark-submit --class ldbc.snb.datagen.LdbcDatagen datagen.jar \
+  --scale-factor 1000 -f csv -n 24 --output-dir out/enhanced \
+  --skip-generation --input-dir out/native \
+  --enhance-param-file conf/enhance-sf1000.ini
+```
+
+`scripts/gen-sf1000-two-phase.sh` orchestrates both phases plus structural
+verification under a 64GB default budget (24 threads, 50g heap + 10g
+off-heap); see README for the tunables.
+
 ## Container
 
 The container image is self-contained (JRE 11, Spark 3.2.1, the datagen jar,
-all enhance parameter files and the structural verifier):
+all enhance parameter files and both structural verifiers — line-based and
+Spark-based):
 
 ```bash
 scripts/build-image.sh                                  # build ldbc/datagen-enhance:latest
@@ -148,7 +171,14 @@ docker run --rm -v "$PWD/out:/out" ldbc/datagen-enhance \
   --enhance-param-file /opt/enhance/conf/enhance-defaults.ini
 docker run --rm -v "$PWD/out:/out" --entrypoint python3 \
   ldbc/datagen-enhance /opt/enhance/scripts/verify_enhance.py /out
+docker run --rm -v "$PWD/out:/out" --entrypoint spark-submit \
+  ldbc/datagen-enhance --master 'local[*]' --driver-memory 8g \
+  /opt/enhance/scripts/verify_enhance_spark.py /out --quick
 ```
+
+All `LdbcDatagen` arguments pass through, including the two-phase flags
+(`--skip-transformation` / `--skip-generation --input-dir`) — run the
+container twice for a two-phase large-scale generation.
 
 Inside the image: `/opt/datagen/datagen.jar`, `/opt/enhance/{conf,scripts,docs}`.
 Resource knobs via env: `MASTER`, `DRIVER_MEMORY`, `DRIVER_CORES`, `SPARK_CONF`.

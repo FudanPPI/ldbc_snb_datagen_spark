@@ -15,8 +15,9 @@
 #   scripts/gen-sf1000-two-phase.sh <root-out-dir> [--verify]
 #
 # Environment overrides (apply to both phases):
-#   JAVA_HOME, SPARK_HOME, THREADS (default 32), DRIVER_MEM (default 75g),
-#   OFFHEAP_SIZE (default 15g), SHUFFLE_PARTS (default 1920)
+#   JAVA_HOME, SPARK_HOME, THREADS (default 24), DRIVER_MEM (default 50g),
+#   OFFHEAP_SIZE (default 10g), SHUFFLE_PARTS (default 2400),
+#   SCALE_FACTOR (default 1000), ENHANCE_PARAM_FILE, SPARK_LOCAL_DIR
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
