@@ -13,6 +13,7 @@ import shapeless._
 object TransformationStage extends DatagenStage with Logging {
   case class Args(
       outputDir: String = "out",
+      inputDir: Option[String] = None,
       explodeEdges: Boolean = false,
       explodeAttrs: Boolean = false,
       keepImplicitDeletes: Boolean = false,
@@ -52,7 +53,9 @@ object TransformationStage extends DatagenStage with Logging {
 
     type Out = Graph[Mode.Raw.type] :+: Graph[Mode.BI] :+: CNil
 
-    GraphSource(model.graphs.Raw.graphDef, args.outputDir, args.irFormat).read
+    val readDir = args.inputDir.getOrElse(args.outputDir)
+
+    GraphSource(model.graphs.Raw.graphDef, readDir, args.irFormat).read
       .pipeFoldLeft(args.enhance.enabled.fork)((graph, _: Unit) => EnhanceTransform(args.enhance).transform(graph))
       .pipeFoldLeft(args.explodeAttrs.fork)((graph, _: Unit) => ExplodeAttrs.transform(graph))
       .pipeFoldLeft(args.explodeEdges.fork)((graph, _: Unit) => ExplodeEdges.transform(graph))

@@ -18,6 +18,7 @@ object LdbcDatagen extends SparkApp {
       params: Map[String, String] = Map.empty,
       paramFile: Option[String] = None,
       outputDir: String = "out",
+      inputDir: Option[String] = None,
       bulkloadPortion: Double = 0.97,
       explodeEdges: Boolean = false,
       explodeAttrs: Boolean = false,
@@ -31,6 +32,7 @@ object LdbcDatagen extends SparkApp {
       epochMillis: Boolean = false,
       generateFactors: Boolean = false,
       factorFormat: String = "parquet",
+      skipGeneration: Boolean = false,
       enhanceParams: Map[String, String] = Map.empty,
       enhanceParamFile: Option[String] = None
   )
@@ -141,6 +143,21 @@ object LdbcDatagen extends SparkApp {
       opt[Unit]("epoch-millis")
         .action((x, c) => args.epochMillis.set(c)(true))
         .text("Use longs with millis since Unix epoch instead of native dates")
+
+      opt[String]("input-dir")
+        .action((x, c) => args.inputDir.set(c)(Some(x)))
+        .text(
+          "Read pre-generated parquet IR from this directory instead of <output-dir>. " +
+            "Used with --skip-generation for two-phase generation."
+        )
+
+      opt[Unit]("skip-generation")
+        .action((x, c) => args.skipGeneration.set(c)(true))
+        .text(
+          "Skip the native GenerationStage and run only TransformationStage " +
+            "(enhance + convert + write). --input-dir may point at a previously " +
+            "generated IR directory."
+        )
     }
 
     val parsedArgs = parser.parse(args, Args()).getOrElse(throw new RuntimeException("Invalid arguments"))
@@ -161,15 +178,23 @@ object LdbcDatagen extends SparkApp {
       oversizeFactor = args.oversizeFactor
     )
 
-    GenerationStage.run(generatorArgs)
+    if (!args.skipGeneration) {
+      GenerationStage.run(generatorArgs)
 
-    if (args.generateFactors) {
-      val factorArgs = FactorGenerationStage.Args(
-        outputDir = args.outputDir,
-        irFormat = irFormat,
-        format = args.factorFormat
-      )
-      FactorGenerationStage.run(factorArgs)
+      if (args.generateFactors) {
+        val factorArgs = FactorGenerationStage.Args(
+          outputDir = args.outputDir,
+          irFormat = irFormat,
+          format = args.factorFormat
+        )
+        FactorGenerationStage.run(factorArgs)
+      }
+    } else {
+      // Still initialise DatagenContext so Dictionaries are available
+      // (TransformationStage.Args uses Dictionaries.dates for date bounds).
+      val config = GenerationStage.buildConfig(generatorArgs)
+      import ldbc.snb.datagen.generator.DatagenContext
+      DatagenContext.initialize(config)
     }
 
     val enhanceConfig = ldbc.snb.datagen.enhance.EnhanceConfig.load(args.enhanceParamFile, args.enhanceParams) match {
@@ -179,6 +204,7 @@ object LdbcDatagen extends SparkApp {
 
     val transformArgs = TransformationStage.Args(
       outputDir = args.outputDir,
+      inputDir = args.inputDir,
       explodeEdges = args.explodeEdges,
       explodeAttrs = args.explodeAttrs,
       keepImplicitDeletes = args.keepImplicitDeletes,
