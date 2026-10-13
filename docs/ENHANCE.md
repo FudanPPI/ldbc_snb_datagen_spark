@@ -136,6 +136,23 @@ Enable features by flipping knobs in the ini (or appending
 `--enhance-params enhance.enabled=true,...`). Change `enhance.salt` to
 produce a different but equally deterministic variant.
 
+## Container
+
+The container image is self-contained (JRE 11, Spark 3.2.1, the datagen jar,
+all enhance parameter files and the structural verifier):
+
+```bash
+scripts/build-image.sh                                  # build ldbc/datagen-enhance:latest
+docker run --rm -v "$PWD/out:/out" ldbc/datagen-enhance \
+  --scale-factor 1 -f csv --output-dir /out \
+  --enhance-param-file /opt/enhance/conf/enhance-defaults.ini
+docker run --rm -v "$PWD/out:/out" --entrypoint python3 \
+  ldbc/datagen-enhance /opt/enhance/scripts/verify_enhance.py /out
+```
+
+Inside the image: `/opt/datagen/datagen.jar`, `/opt/enhance/{conf,scripts,docs}`.
+Resource knobs via env: `MASTER`, `DRIVER_MEMORY`, `DRIVER_CORES`, `SPARK_CONF`.
+
 ## Validation
 
 `scripts/verify_enhance.py` runs a structural gate over the combined output

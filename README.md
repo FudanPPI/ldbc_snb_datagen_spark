@@ -68,18 +68,46 @@ enhance.hotcold.split   = false
 
 ## 快速开始
 
-### 构建
+### 方式一：容器（推荐）
+
+镜像自包含 JRE 11 + Spark 3.2.1 + datagen jar + 全部增强参数文件与校验脚本，可在任何有 Docker 的机器上直接生成数据：
+
+```bash
+# 构建镜像（下载源仅 github.com / repo1.maven.org / archive.apache.org；
+# Docker Hub 不可达时自动改用 cdimage.ubuntu.com 的最小 rootfs 作基础镜像）
+./scripts/build-image.sh                 # 产出 ldbc/datagen-enhance:latest
+
+# 原生模式：SF1 全量 CSV 输出到宿主 ./out
+docker run --rm -v "$(pwd)/out:/out" ldbc/datagen-enhance \
+  --scale-factor 1 -f csv -n 8 --output-dir /out
+
+# 增强模式：全特性参数文件（镜像内置 /opt/enhance/conf/）
+docker run --rm -v "$(pwd)/out:/out" \
+  -e DRIVER_MEMORY=8g -e MASTER='local[8]' \
+  -e SPARK_CONF="spark.local.dir=/tmp/sparktmp" \
+  ldbc/datagen-enhance \
+  --scale-factor 1 -f csv -n 8 --output-dir /out \
+  --enhance-param-file /opt/enhance/conf/enhance-defaults.ini
+
+# 结构校验（feature 痕迹、FK 完整性、行数守恒）
+docker run --rm -v "$(pwd)/out:/out" --entrypoint python3 \
+  ldbc/datagen-enhance /opt/enhance/scripts/verify_enhance.py /out
+```
+
+容器内资源通过环境变量控制：`MASTER`（默认 `local[*]`）、`DRIVER_MEMORY`（默认 `4g`）、`DRIVER_CORES`、`SPARK_CONF`（额外的 `-c k=v` 对）。自定义参数文件挂载进容器即可（`-v $PWD/my.ini:/my.ini`）。
+
+### 方式二：本地构建
 
 ```bash
 # 依赖：JDK 8/11（勿用 17）、sbt、Spark 3.2.x
-./scripts/build.sh          # sbt assembly，产出 jar-with-dependencies
+./scripts/build.sh          # sbt assembly，产出 target/ldbc_snb_datagen_2.12-*-jar-with-dependencies.jar
 ```
 
 ### 运行（原生模式）
 
 ```bash
 spark-submit --class ldbc.snb.datagen.LdbcDatagen \
-  target/scala-2.12/ldbc-snb-datagen_2.12_spark3.2-0.6.0-enhance-jar-with-dependencies.jar \
+  target/ldbc_snb_datagen_2.12-0.6.0-enhance-jar-with-dependencies.jar \
   --scale-factor 1 --format csv --mode raw --output-dir out_sf1_native
 ```
 
@@ -87,29 +115,32 @@ spark-submit --class ldbc.snb.datagen.LdbcDatagen \
 
 ```bash
 spark-submit --class ldbc.snb.datagen.LdbcDatagen \
-  target/scala-2.12/ldbc-snb-datagen_2.12_spark3.2-0.6.0-enhance-jar-with-dependencies.jar \
+  target/ldbc_snb_datagen_2.12-0.6.0-enhance-jar-with-dependencies.jar \
   --scale-factor 1 --format csv --mode raw --output-dir out_sf1_enhanced \
   --enhance-param-file conf/enhance-defaults.ini
 # 或命令行直接传参：
 #   --enhance-params enhance.enabled=true,enhance.remap.enabled=true,enhance.supernode.rate=0.001
 ```
 
-- `--enhance-param-file <file>`：增强参数文件（INI 格式 `key=value`），样例见 [conf/enhance-defaults.ini](conf/enhance-defaults.ini)（全关 + 注释文档）；
+- `--enhance-param-file <file>`：增强参数文件（INI 格式 `key=value`），样例见 [conf/enhance-defaults.ini](conf/enhance-defaults.ini)（全关 + 注释文档）与 [conf/enhance-sf1000.ini](conf/enhance-sf1000.ini)（SF1000 全特性）；
 - `--enhance-params k=v[,k=v...]`：命令行覆盖，优先级高于参数文件；
 - 未指定时**完全等同原生行为**。
 
 ### 1TB 级生成（SF1000）
 
-参见 [scripts/gen-sf1000.sh](scripts/gen-sf1000.sh)：先一次性生成原生 IR（parquet），再基于 IR 输出「原生基线」与「增强版」两份 CSV（增强调参只需重跑第二阶段，无需重新生成 IR）。
+参见 [scripts/gen-sf1000.sh](scripts/gen-sf1000.sh)：单机大内存直出全流程（60 线程 / 90g driver / 960 shuffle 分区 / oversize-factor 4），参数文件 [conf/enhance-sf1000.ini](conf/enhance-sf1000.ini)。脚本拒绝覆盖已存在的输出目录，可选生成后自动校验：
 
 ```bash
-./scripts/gen-sf1000.sh            # 全流程：IR 生成 + 双版本输出 + 校验
+./scripts/gen-sf1000.sh /path/to/sf1000-out            # 全流程生成
+./scripts/gen-sf1000.sh /path/to/sf1000-out --verify    # 生成 + 结构校验
 ```
 
 ### 验证增强特征
 
 ```bash
-python3 tools/verify_enhance.py --dir out_sf1_enhanced   # 校验超节点度数、Zipf 直方图、脏数据占比、分区聚集、突发窗口等
+python3 scripts/verify_enhance.py <enhanced-output-dir> [native-output-dir]
+# 校验：预留带 Person 数、超级节点度数偏斜、热点回复、突发窗口、脏数据痕迹、
+#       Zipf 偏斜、FK 完整性（故意脏行除外）、与原生基线的行数对照
 ```
 
 ## 增强实现架构
@@ -123,7 +154,7 @@ TransformationStage:
       → ExplodeAttrs → ExplodeEdges → [BI 转换] → ConvertDates → GraphSink(最终 CSV)
 ```
 
-- 增强模块全部基于 Spark DataFrame 表达式 + `xxhash64` 确定性哈希（无 UDF、无窗口排序），可扩展至 SF1000（2.7 亿 Person、18 亿+边）；
+- 增强模块全部基于 Spark DataFrame 表达式 + `xxhash64` 确定性哈希（无 UDF、无窗口排序），可扩展至 SF1000（约 1062 万 Person、数十亿级边）；
 - IR 生成一次后可反复只重跑 TransformationStage 调增强参数；
 - 模块执行顺序固定：分区重映射先行（保证新增边/聚集基于重映射后的 ID），脏数据最后（避免被其它模块"修复"）。
 
@@ -139,7 +170,7 @@ TransformationStage:
 
 | 参数 | 说明 |
 |---|---|
-| `--scale-factor` | 规模因子（SF1 ≈ 27 万 Person；SF1000 ≈ 2.7 亿） |
+| `--scale-factor` | 规模因子（SF1 ≈ 1.06 万 Person；SF1000 ≈ 1062 万） |
 | `--mode raw / bi` | 原始快照 / BI 快照+增量更新流 |
 | `--format csv / parquet` | 输出格式（sep=`\|`，带 header） |
 | `--oversize-factor` | 控制文件大小/数量 |

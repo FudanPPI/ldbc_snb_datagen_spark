@@ -6,8 +6,13 @@
 #   scripts/gen-sf1000.sh <output-dir> [--verify [native-dir]]
 #
 # Environment overrides:
-#   JAVA_HOME, SPARK_HOME, THREADS (default 60), DRIVER_MEM (default 90g),
+#   JAVA_HOME, SPARK_HOME, THREADS (default 60), DRIVER_MEM (default 75g),
 #   SHUFFLE_PARTS (default 960), LOG (default /tmp/sf1000-gen.log)
+#
+# Memory sizing: local[N] mode runs driver+executor in one JVM; its resident
+# footprint reaches roughly heap + 20% (off-heap/netty/GC/stacks). On a 125G
+# host, 75g heap keeps total RSS ~90G, leaving headroom for the OS and any
+# other work — with 90g heap the kernel OOM-killed the run once.
 #
 # The output directory must not exist (refuses to overwrite a terabyte run).
 # With --verify, scripts/verify_enhance.py runs after generation succeeds.
@@ -27,7 +32,7 @@ JAR="$REPO/target/ldbc_snb_datagen_2.12_spark3.2-0.6.0-enhance-jar-with-dependen
 JAVA_HOME=${JAVA_HOME:-$HOME/.local/jdk}
 SPARK_HOME=${SPARK_HOME:-$HOME/.local/opt/spark-3.2.2-bin-hadoop3.2}
 THREADS=${THREADS:-60}
-DRIVER_MEM=${DRIVER_MEM:-90g}
+DRIVER_MEM=${DRIVER_MEM:-75g}
 SHUFFLE_PARTS=${SHUFFLE_PARTS:-960}
 LOG=${LOG:-/tmp/sf1000-gen.log}
 export JAVA_HOME PATH="$JAVA_HOME/bin:$PATH"
