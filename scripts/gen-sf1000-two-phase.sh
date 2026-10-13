@@ -15,8 +15,8 @@
 #   scripts/gen-sf1000-two-phase.sh <root-out-dir> [--verify]
 #
 # Environment overrides (apply to both phases):
-#   JAVA_HOME, SPARK_HOME, THREADS (default 24), DRIVER_MEM (default 50g),
-#   OFFHEAP_SIZE (default 10g), SHUFFLE_PARTS (default 2400),
+#   JAVA_HOME, SPARK_HOME, THREADS (default 16), DRIVER_MEM (default 50g),
+#   OFFHEAP_SIZE (default 10g), SHUFFLE_PARTS (default 4800),
 #   SCALE_FACTOR (default 1000), ENHANCE_PARAM_FILE, SPARK_LOCAL_DIR
 # ---------------------------------------------------------------------------
 set -euo pipefail
@@ -31,10 +31,10 @@ JAR="$REPO/target/ldbc_snb_datagen_2.12_spark3.2-0.6.0-enhance-jar-with-dependen
 
 JAVA_HOME=${JAVA_HOME:-$HOME/.local/jdk}
 SPARK_HOME=${SPARK_HOME:-$HOME/.local/opt/spark-3.2.2-bin-hadoop3.2}
-THREADS=${THREADS:-24}
+THREADS=${THREADS:-16}
 DRIVER_MEM=${DRIVER_MEM:-50g}
 OFFHEAP_SIZE=${OFFHEAP_SIZE:-10g}
-SHUFFLE_PARTS=${SHUFFLE_PARTS:-2400}
+SHUFFLE_PARTS=${SHUFFLE_PARTS:-4800}
 SCALE_FACTOR=${SCALE_FACTOR:-1000}
 ENHANCE_PARAM_FILE=${ENHANCE_PARAM_FILE:-$REPO/conf/enhance-sf1000.ini}
 export JAVA_HOME PATH="$JAVA_HOME/bin:$PATH"

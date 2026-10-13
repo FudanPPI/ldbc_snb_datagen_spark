@@ -144,7 +144,7 @@ SF1000 规模下单阶段直出时，merged knows 边集（约 10.5 亿条）会
 - `--verify`：结束后自动运行 Spark 版结构校验
   （[scripts/verify_enhance_spark.py](scripts/verify_enhance_spark.py)）。
 
-默认 64GB 内存预算（24 线程 / 50g driver 堆 + 10g off-heap / 2400 shuffle
+默认 64GB 内存预算（16 线程 / 50g driver 堆 + 10g off-heap / 4800 shuffle
 分区），可用环境变量覆盖：`THREADS`、`DRIVER_MEM`、`OFFHEAP_SIZE`、
 `SHUFFLE_PARTS`、`SCALE_FACTOR`、`ENHANCE_PARAM_FILE`（默认
 [conf/enhance-sf1000.ini](conf/enhance-sf1000.ini)）。SF100 已完成全流程
