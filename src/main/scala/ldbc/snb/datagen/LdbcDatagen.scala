@@ -33,6 +33,7 @@ object LdbcDatagen extends SparkApp {
       generateFactors: Boolean = false,
       factorFormat: String = "parquet",
       skipGeneration: Boolean = false,
+      skipTransformation: Boolean = false,
       enhanceParams: Map[String, String] = Map.empty,
       enhanceParamFile: Option[String] = None
   )
@@ -158,6 +159,14 @@ object LdbcDatagen extends SparkApp {
             "(enhance + convert + write). --input-dir may point at a previously " +
             "generated IR directory."
         )
+
+      opt[Unit]("skip-transformation")
+        .action((x, c) => args.skipTransformation.set(c)(true))
+        .text(
+          "Skip the TransformationStage pass-through (raw IR → native CSV). " +
+            "Useful with two-phase generation where Phase 2 reads parquet IR " +
+            "directly — Phase 1 only writes parquet IR, saving the redundant CSV write."
+        )
     }
 
     val parsedArgs = parser.parse(args, Args()).getOrElse(throw new RuntimeException("Invalid arguments"))
@@ -197,30 +206,32 @@ object LdbcDatagen extends SparkApp {
       DatagenContext.initialize(config)
     }
 
-    val enhanceConfig = ldbc.snb.datagen.enhance.EnhanceConfig.load(args.enhanceParamFile, args.enhanceParams) match {
-      case Right(c)   => c
-      case Left(errs) => throw new RuntimeException(s"Invalid enhance configuration: $errs")
+    if (!args.skipTransformation) {
+      val enhanceConfig = ldbc.snb.datagen.enhance.EnhanceConfig.load(args.enhanceParamFile, args.enhanceParams) match {
+        case Right(c)   => c
+        case Left(errs) => throw new RuntimeException(s"Invalid enhance configuration: $errs")
+      }
+
+      val transformArgs = TransformationStage.Args(
+        outputDir = args.outputDir,
+        inputDir = args.inputDir,
+        explodeEdges = args.explodeEdges,
+        explodeAttrs = args.explodeAttrs,
+        keepImplicitDeletes = args.keepImplicitDeletes,
+        simulationStart = Dictionaries.dates.getSimulationStart,
+        simulationEnd = Dictionaries.dates.getSimulationEnd,
+        mode = args.mode match {
+          case "bi"          => Mode.BI(bulkloadPortion = args.bulkloadPortion, batchPeriod = args.batchPeriod)
+          case "raw"         => Mode.Raw
+        },
+        irFormat,
+        args.format,
+        args.formatOptions,
+        args.epochMillis,
+        enhance = enhanceConfig
+      )
+
+      TransformationStage.run(transformArgs)
     }
-
-    val transformArgs = TransformationStage.Args(
-      outputDir = args.outputDir,
-      inputDir = args.inputDir,
-      explodeEdges = args.explodeEdges,
-      explodeAttrs = args.explodeAttrs,
-      keepImplicitDeletes = args.keepImplicitDeletes,
-      simulationStart = Dictionaries.dates.getSimulationStart,
-      simulationEnd = Dictionaries.dates.getSimulationEnd,
-      mode = args.mode match {
-        case "bi"          => Mode.BI(bulkloadPortion = args.bulkloadPortion, batchPeriod = args.batchPeriod)
-        case "raw"         => Mode.Raw
-      },
-      irFormat,
-      args.format,
-      args.formatOptions,
-      args.epochMillis,
-      enhance = enhanceConfig
-    )
-
-    TransformationStage.run(transformArgs)
   }
 }

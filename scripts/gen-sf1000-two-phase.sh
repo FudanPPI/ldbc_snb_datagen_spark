@@ -30,11 +30,12 @@ JAR="$REPO/target/ldbc_snb_datagen_2.12_spark3.2-0.6.0-enhance-jar-with-dependen
 
 JAVA_HOME=${JAVA_HOME:-$HOME/.local/jdk}
 SPARK_HOME=${SPARK_HOME:-$HOME/.local/opt/spark-3.2.2-bin-hadoop3.2}
-THREADS=${THREADS:-32}
-DRIVER_MEM=${DRIVER_MEM:-75g}
-OFFHEAP_SIZE=${OFFHEAP_SIZE:-15g}
-SHUFFLE_PARTS=${SHUFFLE_PARTS:-1920}
+THREADS=${THREADS:-24}
+DRIVER_MEM=${DRIVER_MEM:-50g}
+OFFHEAP_SIZE=${OFFHEAP_SIZE:-10g}
+SHUFFLE_PARTS=${SHUFFLE_PARTS:-2400}
 SCALE_FACTOR=${SCALE_FACTOR:-1000}
+ENHANCE_PARAM_FILE=${ENHANCE_PARAM_FILE:-$REPO/conf/enhance-sf1000.ini}
 export JAVA_HOME PATH="$JAVA_HOME/bin:$PATH"
 
 NATIVE_OUT="$ROOT/native"
@@ -48,17 +49,26 @@ LOG_P2="/tmp/sf1000-phase2.log"
 SPARK_LOCAL_DIR=${SPARK_LOCAL_DIR:-/tmp/sf1000-sparktmp}
 mkdir -p "$SPARK_LOCAL_DIR"
 
+# cap dirty page cache growth for the duration of the run
+( while true; do sleep 30; sync; done ) &
+SYNC_PID=$!
+trap 'kill "$SYNC_PID" 2>/dev/null || true' EXIT
+
 run_phase() {
-  local phase="$1" log="$2" out="$3" skip_gen="$4" input_dir="${5:-}"
+  local phase="$1" log="$2" out="$3" skip_gen="$4" input_dir="${5:-}" skip_trans="$6"
+  local enh_param="${7:-}"
   local -a extra_args=()
   [[ -n "$skip_gen" ]] && extra_args+=(--skip-generation)
+  [[ -n "$skip_trans" ]] && extra_args+=(--skip-transformation)
   [[ -n "$input_dir" ]] && extra_args+=(--input-dir "$input_dir")
+  [[ -n "$enh_param" ]] && extra_args+=(--enhance-param-file "$enh_param")
 
   echo "=== Phase $phase starting $(date -Is) ==="
   echo "    output:  $out"
   echo "    log:     $log"
   echo "    threads: $THREADS  driver-mem: $DRIVER_MEM  off-heap: $OFFHEAP_SIZE"
   [[ -n "$skip_gen" ]] && echo "    skip-generation: yes"
+  [[ -n "$skip_trans" ]] && echo "    skip-transformation: yes"
   [[ -n "$input_dir" ]] && echo "    input-dir: $input_dir"
 
   "$SPARK_HOME/bin/spark-submit" \
@@ -87,17 +97,17 @@ run_phase() {
 }
 
 phase1() {
-  # Phase 1: native IR + native CSV pass-through (no enhance)
+  # Phase 1: generate native SF IR only (skip TransformationStage — Phase 2 reads it directly)
   [[ -d $NATIVE_OUT ]] && { echo "Phase 1 output already exists: $NATIVE_OUT (refusing to overwrite)" >&2; exit 1; }
-  run_phase 1 "$LOG_P1" "$NATIVE_OUT" "" ""
+  run_phase 1 "$LOG_P1" "$NATIVE_OUT" "" "" "yes" ""
 }
 
 phase2() {
-  # Phase 2: enhance-only, reads native IR, writes enhanced CSV
+  # Phase 2: enhance-only from native IR → enhanced CSV
   [[ ! -d $NATIVE_OUT ]] && { echo "Phase 1 output not found: $NATIVE_OUT (run Phase 1 first)" >&2; exit 1; }
   [[ -d $ENH_OUT ]] && { echo "Phase 2 output already exists: $ENH_OUT (refusing to overwrite)" >&2; exit 1; }
 
-  run_phase 2 "$LOG_P2" "$ENH_OUT" "yes" "$NATIVE_OUT"
+  run_phase 2 "$LOG_P2" "$ENH_OUT" "yes" "$NATIVE_OUT" "" "$ENHANCE_PARAM_FILE"
 }
 
 phase1

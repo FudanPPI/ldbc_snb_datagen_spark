@@ -6,6 +6,7 @@ import ldbc.snb.datagen.io.raw.{Csv, Parquet, RawSink}
 import ldbc.snb.datagen.syntax._
 import ldbc.snb.datagen.util._
 import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.spark.storage.StorageLevel
 
 import java.net.URI
 object GenerationStage extends DatagenStage with Logging {
@@ -49,7 +50,7 @@ object GenerationStage extends DatagenStage with Logging {
     val interestKnows = SparkKnowsGenerator(persons, interestRanker, config, percentages, 1, knowsGeneratorClassName)
     val randomKnows   = SparkKnowsGenerator(persons, randomRanker, config, percentages, 2, knowsGeneratorClassName)
 
-    val merged = SparkKnowsMerger(uniKnows, interestKnows, randomKnows).cache()
+    val merged = SparkKnowsMerger(uniKnows, interestKnows, randomKnows).persist(StorageLevel.MEMORY_AND_DISK)
 
     val format = args.format match {
       case "csv"     => Csv
