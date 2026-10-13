@@ -6,13 +6,22 @@
 #   scripts/gen-sf1000.sh <output-dir> [--verify [native-dir]]
 #
 # Environment overrides:
-#   JAVA_HOME, SPARK_HOME, THREADS (default 60), DRIVER_MEM (default 75g),
+#   JAVA_HOME, SPARK_HOME, THREADS (default 32), DRIVER_MEM (default 75g),
 #   SHUFFLE_PARTS (default 960), LOG (default /tmp/sf1000-gen.log)
 #
 # Memory sizing: local[N] mode runs driver+executor in one JVM; its resident
 # footprint reaches roughly heap + 20% (off-heap/netty/GC/stacks). On a 125G
 # host, 75g heap keeps total RSS ~90G, leaving headroom for the OS and any
 # other work — with 90g heap the kernel OOM-killed the run once.
+#
+# Concurrency sizing: each task holds one parquet writer per entity file
+# (~14 files/task), so 60 threads opened ~840 writers at once, saturating
+# the execution-memory pool (271 "exceeds 95% of heap" warnings) and
+# thrashing GC into a multi-hour hang before the second kernel OOM kill.
+# 32 threads halves the writer burst (~450) — this is the root-cause fix,
+# not the heap size. The sync loop below additionally caps dirty page cache
+# buildup (default vm.dirty_ratio allows ~25G on 125G RAM) from TB-scale
+# writes landing on top of the ~88G JVM RSS.
 #
 # The output directory must not exist (refuses to overwrite a terabyte run).
 # With --verify, scripts/verify_enhance.py runs after generation succeeds.
@@ -31,7 +40,7 @@ JAR="$REPO/target/ldbc_snb_datagen_2.12_spark3.2-0.6.0-enhance-jar-with-dependen
 
 JAVA_HOME=${JAVA_HOME:-$HOME/.local/jdk}
 SPARK_HOME=${SPARK_HOME:-$HOME/.local/opt/spark-3.2.2-bin-hadoop3.2}
-THREADS=${THREADS:-60}
+THREADS=${THREADS:-32}
 DRIVER_MEM=${DRIVER_MEM:-75g}
 SHUFFLE_PARTS=${SHUFFLE_PARTS:-960}
 LOG=${LOG:-/tmp/sf1000-gen.log}
@@ -43,6 +52,11 @@ export JAVA_HOME PATH="$JAVA_HOME/bin:$PATH"
 # keep shuffle spill off the output disk when possible
 SPARK_LOCAL_DIR=${SPARK_LOCAL_DIR:-/tmp/sf1000-sparktmp}
 mkdir -p "$SPARK_LOCAL_DIR"
+
+# cap dirty page cache growth for the duration of the run
+( while true; do sleep 30; sync; done ) &
+SYNC_PID=$!
+trap 'kill "$SYNC_PID" 2>/dev/null || true' EXIT
 
 echo "=== SF1000 generation starting $(date -Is) ==="
 echo "    output: $OUT"
